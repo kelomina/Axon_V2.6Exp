@@ -1,0 +1,51 @@
+# Axon v2.6 Experiment - .gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+venv/
+vnev/
+.env/
+
+# Data
+data/
+*.npz
+*.csv
+*.txt
+
+# Models
+models/
+*.pt
+*.pth
+
+# Reports
+reports/
+*.log
+*.json
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation
+agents.md
+
+# Build
+dist/
+build/
+*.egg-info/
