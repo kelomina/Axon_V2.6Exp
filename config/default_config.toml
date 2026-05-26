@@ -1,0 +1,63 @@
+# Axon v2.6 实验配置文件
+# 本配置文件定义默认的训练和模型参数
+
+[experiment]
+name = axon_v2.6_exp
+seed = 42
+
+[model]
+# 字节序列处理
+max_byte_length = 65536
+byte_embedding_dim = 128
+
+# DSRA 配置
+dsra_dim = 128
+dsra_heads = 4
+dsra_slots = 128
+dsra_read_topk = 8
+dsra_write_topk = 4
+dsra_local_window = 256
+dsra_chunk_size = 512
+
+# PE 特征处理
+pe_feature_dim = 1500
+pe_projection_dim = 128
+
+# 融合配置
+fusion_type = concat
+dropout = 0.1
+
+[training]
+# 优化器
+optimizer = adamw
+learning_rate = 0.0001
+weight_decay = 0.00001
+
+# 学习率调度
+lr_scheduler = cosine
+warmup_epochs = 3
+min_lr = 0.000001
+
+# 训练策略
+max_epochs = 50
+early_stopping_patience = 5
+gradient_clip = 1.0
+
+# 批次
+batch_size = 16
+num_workers = 4
+pin_memory = true
+
+[data]
+# 数据路径
+data_dir = data/samples
+cache_dir = data/.cache
+output_dir = models
+log_dir = reports/logs
+
+# 评估
+eval_interval = 1
+save_best_only = true
+
+[device]
+device = cuda
