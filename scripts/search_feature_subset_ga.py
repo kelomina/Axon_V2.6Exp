@@ -90,6 +90,10 @@ class FitnessConfig:
     fn_penalty: float = 0.0
     min_objective: Optional[float] = None
     below_min_penalty: float = 2.0
+    min_recall: Optional[float] = None
+    max_fn_rate: Optional[float] = None
+    recall_guard_penalty: float = 3.0
+    fn_guard_penalty: float = 3.0
 
 
 @dataclass(frozen=True)
@@ -183,6 +187,12 @@ def compute_fitness(metrics: dict, kept_ratio: float, fitness_config: FitnessCon
     sample_count = max(1, int(metrics.get("sample_count", 0)))
     fp_rate = float(metrics.get("fp", 0)) / sample_count
     fn_rate = float(metrics.get("fn", 0)) / sample_count
+    recall_gap = 0.0
+    if fitness_config.min_recall is not None:
+        recall_gap = max(0.0, float(fitness_config.min_recall) - float(metrics.get("recall", 0.0)))
+    fn_gap = 0.0
+    if fitness_config.max_fn_rate is not None:
+        fn_gap = max(0.0, fn_rate - float(fitness_config.max_fn_rate))
 
     below_min = 0.0
     if fitness_config.min_objective is not None:
@@ -198,6 +208,8 @@ def compute_fitness(metrics: dict, kept_ratio: float, fitness_config: FitnessCon
         - fitness_config.fp_penalty * fp_rate
         - fitness_config.fn_penalty * fn_rate
         - fitness_config.below_min_penalty * below_min
+        - fitness_config.recall_guard_penalty * recall_gap
+        - fitness_config.fn_guard_penalty * fn_gap
     )
 
 
@@ -646,6 +658,121 @@ def write_leaderboard_csv(path: Path, rows: Sequence[dict]) -> None:
             )
 
 
+def individual_from_selected_indices(
+    spec: FeatureMaskSpec,
+    pe_indices: Sequence[int],
+    stat_indices: Sequence[int],
+) -> np.ndarray:
+    individual = np.zeros(spec.search_dim, dtype=bool)
+    for index in pe_indices:
+        index = int(index)
+        if index < 0 or index >= spec.pe_search_dim:
+            raise ValueError(f"PE feature index out of searched range: {index}")
+        individual[index] = True
+    for index in stat_indices:
+        index = int(index)
+        if index < 0 or index >= spec.stat_feature_dim:
+            raise ValueError(f"stat feature index out of range: {index}")
+        individual[spec.pe_search_dim + index] = True
+    return individual
+
+
+def load_feature_mask(path: Path, spec: FeatureMaskSpec) -> np.ndarray:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    mask_spec = payload.get("mask_spec", {})
+    expected = {
+        "pe_feature_dim": spec.pe_feature_dim,
+        "pe_search_dim": spec.pe_search_dim,
+        "stat_feature_dim": spec.stat_feature_dim,
+    }
+    for key, value in expected.items():
+        if key in mask_spec and int(mask_spec[key]) != value:
+            raise ValueError(
+                f"Feature mask {path} was built for {key}={mask_spec[key]}, "
+                f"but current config expects {value}"
+            )
+
+    if "individual" in payload:
+        individual = np.asarray(payload["individual"], dtype=bool)
+        if individual.shape[0] != spec.search_dim:
+            raise ValueError(
+                f"Feature mask individual has length {individual.shape[0]}, "
+                f"expected {spec.search_dim}"
+            )
+        return individual
+
+    return individual_from_selected_indices(
+        spec,
+        payload.get("selected_pe_indices", []),
+        payload.get("selected_stat_indices", []),
+    )
+
+
+def build_feature_mask_payload(
+    *,
+    spec: FeatureMaskSpec,
+    individual: np.ndarray,
+    source_report: Optional[str],
+    checkpoint: str,
+    search_metrics: Optional[dict],
+    holdout_metrics: Optional[dict],
+    baseline_metrics: Optional[dict],
+    note: str,
+) -> dict:
+    pe_indices, stat_indices = spec.selected_indices(individual)
+    return {
+        "version": 1,
+        "type": "axon_feature_mask",
+        "source_report": source_report,
+        "checkpoint": checkpoint,
+        "note": note,
+        "mask_spec": {
+            "pe_feature_dim": spec.pe_feature_dim,
+            "pe_search_dim": spec.pe_search_dim,
+            "ignored_pe_dim": spec.ignored_pe_dim,
+            "stat_feature_dim": spec.stat_feature_dim,
+            "search_dim": spec.search_dim,
+        },
+        "kept_total": int(individual.sum()),
+        "kept_pe": len(pe_indices),
+        "kept_stat": len(stat_indices),
+        "selected_pe_indices": pe_indices,
+        "selected_stat_indices": stat_indices,
+        "individual": individual.astype(bool).tolist(),
+        "search_metrics": search_metrics,
+        "holdout_metrics": holdout_metrics,
+        "baseline_metrics": baseline_metrics,
+    }
+
+
+def export_mask_from_report(
+    report_path: Path,
+    output_path: Path,
+    note: str = "",
+) -> dict:
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    best = report["best"]
+    mask_spec = report["mask_spec"]
+    spec = FeatureMaskSpec(
+        pe_feature_dim=int(mask_spec["pe_feature_dim"]),
+        stat_feature_dim=int(mask_spec["stat_feature_dim"]),
+        pe_search_dim=int(mask_spec["pe_search_dim"]),
+    )
+    individual = np.asarray(best["individual"], dtype=bool)
+    payload = build_feature_mask_payload(
+        spec=spec,
+        individual=individual,
+        source_report=str(report_path),
+        checkpoint=str(report.get("checkpoint", "")),
+        search_metrics=best.get("metrics"),
+        holdout_metrics=(report.get("best_holdout") or {}).get("metrics"),
+        baseline_metrics=(report.get("holdout_full_features") or report.get("baseline_full_features") or {}).get("metrics"),
+        note=note,
+    )
+    write_json(output_path, payload)
+    return payload
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -653,7 +780,7 @@ def build_parser() -> argparse.ArgumentParser:
             "The byte sequence branch is kept unchanged."
         )
     )
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--data-dir", type=str, default=None)
     parser.add_argument("--cache-dir", type=str, default=None)
     parser.add_argument("--split", choices=["train", "val", "test", "all"], default="val")
@@ -663,6 +790,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-batches", type=int, default=20, help="0 means no limit")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument(
+        "--feature-mask",
+        type=Path,
+        default=None,
+        help="Evaluate this exported feature mask instead of searching from scratch.",
+    )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        default=False,
+        help="Only evaluate --feature-mask and full-feature baseline; do not run GA.",
+    )
+    parser.add_argument(
+        "--export-mask",
+        type=Path,
+        default=None,
+        help="Write the best GA mask, or the evaluated --feature-mask, to this JSON path.",
+    )
+    parser.add_argument(
+        "--export-mask-from-report",
+        type=Path,
+        default=None,
+        help="Convert an existing GA report JSON into a reusable feature mask JSON.",
+    )
+    parser.add_argument("--mask-note", type=str, default="")
     parser.add_argument(
         "--holdout-ratio",
         type=float,
@@ -707,6 +859,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--below-min-penalty", type=float, default=2.0)
+    parser.add_argument(
+        "--max-recall-drop",
+        type=float,
+        default=None,
+        help="Extra guard: penalize candidates whose recall is below baseline recall minus this value.",
+    )
+    parser.add_argument(
+        "--max-fn-increase-rate",
+        type=float,
+        default=None,
+        help=(
+            "Extra guard: penalize candidates whose FN/sample rate exceeds baseline "
+            "FN/sample rate by more than this value."
+        ),
+    )
+    parser.add_argument("--recall-guard-penalty", type=float, default=3.0)
+    parser.add_argument("--fn-guard-penalty", type=float, default=3.0)
 
     parser.add_argument("--include-pe-padding", action="store_true", default=False)
     parser.add_argument(
@@ -731,10 +900,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.export_mask_from_report:
+        if args.export_mask is None:
+            raise ValueError("--export-mask is required with --export-mask-from-report")
+        payload = export_mask_from_report(
+            args.export_mask_from_report,
+            args.export_mask,
+            note=args.mask_note,
+        )
+        print(
+            f"Exported feature mask: {args.export_mask} "
+            f"(kept={payload['kept_total']}, pe={payload['kept_pe']}, stat={payload['kept_stat']})"
+        )
+        return 0
+
     if args.population_size <= 1:
         raise ValueError("--population-size must be greater than 1")
     if args.generations < 0:
         raise ValueError("--generations must be non-negative")
+    if args.checkpoint is None:
+        raise ValueError("--checkpoint is required unless --export-mask-from-report is used")
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     checkpoint = load_safe_checkpoint(args.checkpoint, map_location=device)
@@ -800,6 +985,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     min_objective = None
     if args.max_objective_drop is not None:
         min_objective = max(0.0, float(baseline_objective) - float(args.max_objective_drop))
+    min_recall = None
+    if args.max_recall_drop is not None:
+        min_recall = max(0.0, float(full_metrics["recall"]) - float(args.max_recall_drop))
+    max_fn_rate = None
+    if args.max_fn_increase_rate is not None:
+        baseline_fn_rate = float(full_metrics["fn"]) / max(1, int(full_metrics["sample_count"]))
+        max_fn_rate = baseline_fn_rate + float(args.max_fn_increase_rate)
 
     fitness_config = FitnessConfig(
         objective=args.objective,
@@ -808,11 +1000,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         fn_penalty=args.fn_penalty,
         min_objective=min_objective,
         below_min_penalty=args.below_min_penalty,
+        min_recall=min_recall,
+        max_fn_rate=max_fn_rate,
+        recall_guard_penalty=args.recall_guard_penalty,
+        fn_guard_penalty=args.fn_guard_penalty,
     )
     holdout_full_metrics = None
     if holdout_batches:
         holdout_full_probs = predict_with_masks(model, holdout_batches, spec, full_individual, device)
         holdout_full_metrics = choose_best_metrics(holdout_labels, holdout_full_probs, thresholds)
+
+    mask_individual = load_feature_mask(args.feature_mask, spec) if args.feature_mask else None
+    mask_metrics = evaluate(mask_individual) if mask_individual is not None else None
+    mask_holdout = None
+    if mask_individual is not None and holdout_batches:
+        mask_holdout_probs = predict_with_masks(model, holdout_batches, spec, mask_individual, device)
+        mask_holdout_metrics = choose_best_metrics(holdout_labels, mask_holdout_probs, thresholds)
+        mask_holdout = summarize_individual(mask_individual, spec, mask_holdout_metrics, fitness_config)
 
     print("Axon feature subset GA")
     print(f"  device: {device}")
@@ -824,6 +1028,73 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"  ignored PE padding dim: {spec.ignored_pe_dim}")
     print(f"  stat search dim: {spec.stat_feature_dim}")
     print(f"  baseline f1: {full_metrics['f1']:.6f}, auc: {full_metrics['auc']}")
+    if mask_metrics is not None:
+        mask_summary = summarize_individual(mask_individual, spec, mask_metrics, fitness_config)
+        print(
+            f"  mask f1: {mask_metrics['f1']:.6f}, auc: {mask_metrics['auc']}, "
+            f"kept={mask_summary['kept_total']}"
+        )
+        if mask_holdout is not None:
+            print(
+                f"  mask holdout f1: {mask_holdout['metrics']['f1']:.6f}, "
+                f"fp={mask_holdout['metrics']['fp']}, fn={mask_holdout['metrics']['fn']}"
+            )
+
+    if args.eval_only:
+        if mask_individual is None:
+            raise ValueError("--eval-only requires --feature-mask")
+        payload = {
+            "checkpoint": str(args.checkpoint),
+            "feature_mask": str(args.feature_mask),
+            "data_dir": args.data_dir,
+            "split": args.split,
+            "split_file": args.split_file,
+            "device": str(device),
+            "loaded_samples": loaded_sample_count,
+            "search_samples": int(labels.shape[0]),
+            "holdout_samples": int(holdout_labels.shape[0]),
+            "thresholds": thresholds,
+            "mask_spec": {
+                "pe_feature_dim": spec.pe_feature_dim,
+                "pe_search_dim": spec.pe_search_dim,
+                "ignored_pe_dim": spec.ignored_pe_dim,
+                "stat_feature_dim": spec.stat_feature_dim,
+                "search_dim": spec.search_dim,
+            },
+            "baseline_full_features": {
+                "kept_pe": spec.pe_search_dim,
+                "kept_stat": spec.stat_feature_dim,
+                "metrics": full_metrics,
+            },
+            "holdout_full_features": (
+                {
+                    "kept_pe": spec.pe_search_dim,
+                    "kept_stat": spec.stat_feature_dim,
+                    "metrics": holdout_full_metrics,
+                }
+                if holdout_full_metrics is not None
+                else None
+            ),
+            "mask_result": summarize_individual(mask_individual, spec, mask_metrics, fitness_config),
+            "mask_holdout": mask_holdout,
+        }
+        write_json(args.output_json, payload)
+        if args.export_mask:
+            write_json(
+                args.export_mask,
+                build_feature_mask_payload(
+                    spec=spec,
+                    individual=mask_individual,
+                    source_report=str(args.output_json),
+                    checkpoint=str(args.checkpoint),
+                    search_metrics=mask_metrics,
+                    holdout_metrics=mask_holdout["metrics"] if mask_holdout else None,
+                    baseline_metrics=holdout_full_metrics or full_metrics,
+                    note=args.mask_note,
+                ),
+            )
+        print(f"  JSON: {args.output_json}")
+        return 0
 
     result = run_genetic_search(
         spec=spec,
@@ -874,6 +1145,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "kept_stat": spec.stat_feature_dim,
             "metrics": full_metrics,
         },
+        "input_feature_mask": str(args.feature_mask) if args.feature_mask else None,
+        "input_feature_mask_result": (
+            summarize_individual(mask_individual, spec, mask_metrics, fitness_config)
+            if mask_individual is not None and mask_metrics is not None
+            else None
+        ),
+        "input_feature_mask_holdout": mask_holdout,
         "holdout_full_features": (
             {
                 "kept_pe": spec.pe_search_dim,
@@ -892,6 +1170,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     write_json(args.output_json, payload)
     write_leaderboard_csv(args.output_csv, payload["leaderboard"])
+    if args.export_mask:
+        write_json(
+            args.export_mask,
+            build_feature_mask_payload(
+                spec=spec,
+                individual=np.asarray(payload["best"]["individual"], dtype=bool),
+                source_report=str(args.output_json),
+                checkpoint=str(args.checkpoint),
+                search_metrics=payload["best"]["metrics"],
+                holdout_metrics=(payload["best_holdout"] or {}).get("metrics"),
+                baseline_metrics=holdout_full_metrics or full_metrics,
+                note=args.mask_note,
+            ),
+        )
 
     best = payload["best"]
     print("\nBest candidate")

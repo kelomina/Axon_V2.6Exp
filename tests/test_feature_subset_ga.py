@@ -10,6 +10,8 @@ from search_feature_subset_ga import (  # noqa: E402
     FitnessConfig,
     compute_fitness,
     choose_best_metrics,
+    export_mask_from_report,
+    load_feature_mask,
     parse_thresholds,
     repair_individual,
     run_genetic_search,
@@ -79,6 +81,29 @@ def test_compute_fitness_respects_min_objective_guard():
     )
 
     assert protected > too_low
+
+
+def test_compute_fitness_respects_recall_and_fn_guards():
+    config = FitnessConfig(
+        objective="f1",
+        feature_penalty=0.0,
+        min_recall=0.9,
+        max_fn_rate=0.05,
+        recall_guard_penalty=4.0,
+        fn_guard_penalty=4.0,
+    )
+    safer = compute_fitness(
+        {"f1": 0.90, "recall": 0.9, "sample_count": 100, "fp": 2, "fn": 5},
+        kept_ratio=0.5,
+        fitness_config=config,
+    )
+    leakier = compute_fitness(
+        {"f1": 0.91, "recall": 0.8, "sample_count": 100, "fp": 1, "fn": 20},
+        kept_ratio=0.5,
+        fitness_config=config,
+    )
+
+    assert safer > leakier
 
 
 def test_repair_individual_enforces_minimum_pe_and_stat_features():
@@ -162,3 +187,34 @@ def test_split_batches_stratified_creates_balanced_holdout():
     assert search_labels.tolist().count(1) == 3
     assert holdout_labels.tolist().count(0) == 1
     assert holdout_labels.tolist().count(1) == 1
+
+
+def test_export_mask_from_report_round_trips_selected_indices(tmp_path):
+    report_path = tmp_path / "report.json"
+    mask_path = tmp_path / "mask.json"
+    report_path.write_text(
+        __import__("json").dumps({
+            "checkpoint": "models/best_model.pt",
+            "mask_spec": {
+                "pe_feature_dim": 5,
+                "pe_search_dim": 3,
+                "stat_feature_dim": 2,
+            },
+            "best": {
+                "individual": [True, False, True, False, True],
+                "metrics": {"f1": 1.0},
+            },
+            "best_holdout": {"metrics": {"f1": 0.9}},
+            "holdout_full_features": {"metrics": {"f1": 0.95}},
+        }),
+        encoding="utf-8",
+    )
+
+    payload = export_mask_from_report(report_path, mask_path, note="unit test")
+    spec = FeatureMaskSpec(pe_feature_dim=5, stat_feature_dim=2, pe_search_dim=3)
+    individual = load_feature_mask(mask_path, spec)
+
+    assert payload["kept_total"] == 3
+    assert payload["selected_pe_indices"] == [0, 2]
+    assert payload["selected_stat_indices"] == [1]
+    assert individual.tolist() == [True, False, True, False, True]
