@@ -88,6 +88,8 @@ class FitnessConfig:
     feature_penalty: float = 0.01
     fp_penalty: float = 0.0
     fn_penalty: float = 0.0
+    min_objective: Optional[float] = None
+    below_min_penalty: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -182,13 +184,20 @@ def compute_fitness(metrics: dict, kept_ratio: float, fitness_config: FitnessCon
     fp_rate = float(metrics.get("fp", 0)) / sample_count
     fn_rate = float(metrics.get("fn", 0)) / sample_count
 
+    below_min = 0.0
+    if fitness_config.min_objective is not None:
+        below_min = max(0.0, float(fitness_config.min_objective) - objective_value)
+
     # 这里的惩罚是业务含义：指标相近时，优先选择更短的特征清单；
     # 如果误报或漏报更敏感，也可以通过 fp/fn penalty 明确压低这类候选。
+    # min_objective 则是保护线：候选低于完整特征基线太多时，不让“少特征”
+    # 掩盖“准确率已明显变差”这个事实。
     return float(
         objective_value
         - fitness_config.feature_penalty * kept_ratio
         - fitness_config.fp_penalty * fp_rate
         - fitness_config.fn_penalty * fn_rate
+        - fitness_config.below_min_penalty * below_min
     )
 
 
@@ -688,6 +697,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feature-penalty", type=float, default=0.01)
     parser.add_argument("--fp-penalty", type=float, default=0.0)
     parser.add_argument("--fn-penalty", type=float, default=0.0)
+    parser.add_argument(
+        "--max-objective-drop",
+        type=float,
+        default=None,
+        help=(
+            "Protect accuracy before compactness. When set, candidates below "
+            "baseline objective minus this drop receive an extra penalty."
+        ),
+    )
+    parser.add_argument("--below-min-penalty", type=float, default=2.0)
 
     parser.add_argument("--include-pe-padding", action="store_true", default=False)
     parser.add_argument(
@@ -755,12 +774,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.seed,
         )
 
-    fitness_config = FitnessConfig(
-        objective=args.objective,
-        feature_penalty=args.feature_penalty,
-        fp_penalty=args.fp_penalty,
-        fn_penalty=args.fn_penalty,
-    )
     ga_config = GeneticConfig(
         population_size=args.population_size,
         generations=args.generations,
@@ -779,6 +792,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     full_individual = np.ones(spec.search_dim, dtype=bool)
     full_metrics = evaluate(full_individual)
+    baseline_objective = (
+        full_metrics["auc"]
+        if args.objective == "auc" and full_metrics["auc"] is not None
+        else full_metrics[args.objective]
+    )
+    min_objective = None
+    if args.max_objective_drop is not None:
+        min_objective = max(0.0, float(baseline_objective) - float(args.max_objective_drop))
+
+    fitness_config = FitnessConfig(
+        objective=args.objective,
+        feature_penalty=args.feature_penalty,
+        fp_penalty=args.fp_penalty,
+        fn_penalty=args.fn_penalty,
+        min_objective=min_objective,
+        below_min_penalty=args.below_min_penalty,
+    )
     holdout_full_metrics = None
     if holdout_batches:
         holdout_full_probs = predict_with_masks(model, holdout_batches, spec, full_individual, device)

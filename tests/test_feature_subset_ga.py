@@ -60,6 +60,27 @@ def test_compute_fitness_penalizes_larger_feature_sets_when_metrics_match():
     assert compact > large
 
 
+def test_compute_fitness_respects_min_objective_guard():
+    config = FitnessConfig(
+        objective="f1",
+        feature_penalty=0.1,
+        min_objective=0.95,
+        below_min_penalty=5.0,
+    )
+    protected = compute_fitness(
+        {"f1": 0.95, "sample_count": 10, "fp": 0, "fn": 0},
+        kept_ratio=0.8,
+        fitness_config=config,
+    )
+    too_low = compute_fitness(
+        {"f1": 0.90, "sample_count": 10, "fp": 0, "fn": 0},
+        kept_ratio=0.1,
+        fitness_config=config,
+    )
+
+    assert protected > too_low
+
+
 def test_repair_individual_enforces_minimum_pe_and_stat_features():
     spec = FeatureMaskSpec(pe_feature_dim=4, stat_feature_dim=3, pe_search_dim=4)
     empty = np.zeros(spec.search_dim, dtype=bool)
