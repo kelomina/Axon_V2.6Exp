@@ -108,6 +108,87 @@ def delta_metrics(mask_row: dict, full_row: dict) -> dict:
     return {key: mask_row[key] - full_row[key] for key in keys}
 
 
+def choose_best_rows(rows: Sequence[dict], variant: str) -> dict:
+    if variant not in {"full", "mask"}:
+        raise ValueError(f"variant must be 'full' or 'mask', got: {variant}")
+    if not rows:
+        raise ValueError("at least one threshold row is required")
+
+    best_f1 = max(
+        rows,
+        key=lambda row: (
+            row[variant]["f1"],
+            -row[variant]["errors"],
+            row[variant]["precision"],
+            row[variant]["recall"],
+            row[variant]["accuracy"],
+        ),
+    )
+    best_errors = min(
+        rows,
+        key=lambda row: (
+            row[variant]["errors"],
+            -row[variant]["f1"],
+            -row[variant]["recall"],
+            -row[variant]["precision"],
+            -row[variant]["accuracy"],
+        ),
+    )
+    return {
+        "best_f1": best_f1,
+        "best_errors": best_errors,
+    }
+
+
+def row_at_threshold(rows: Sequence[dict], threshold: float, tolerance: float = 1e-9) -> dict:
+    for row in rows:
+        if abs(float(row["threshold"]) - float(threshold)) <= tolerance:
+            return row
+    available = ", ".join(f"{float(row['threshold']):.4g}" for row in rows)
+    raise ValueError(
+        f"baseline threshold {threshold} is not in --thresholds. Available thresholds: {available}"
+    )
+
+
+def build_summary(rows: Sequence[dict], baseline_threshold: float) -> dict:
+    baseline_row = row_at_threshold(rows, baseline_threshold)
+    baseline_full = baseline_row["full"]
+    full_best = choose_best_rows(rows, "full")
+    mask_best = choose_best_rows(rows, "mask")
+
+    def pack(row: dict, variant: str) -> dict:
+        metrics = row[variant]
+        return {
+            "threshold": float(row["threshold"]),
+            "metrics": metrics,
+            "delta_vs_baseline_full": delta_metrics(metrics, baseline_full),
+        }
+
+    return {
+        "baseline_threshold": float(baseline_row["threshold"]),
+        "baseline_full": {
+            "threshold": float(baseline_row["threshold"]),
+            "metrics": baseline_full,
+        },
+        "best_full_f1": pack(full_best["best_f1"], "full"),
+        "best_full_errors": pack(full_best["best_errors"], "full"),
+        "best_mask_f1": pack(mask_best["best_f1"], "mask"),
+        "best_mask_errors": pack(mask_best["best_errors"], "mask"),
+    }
+
+
+def format_summary_line(label: str, item: dict) -> str:
+    metrics = item["metrics"]
+    delta = item["delta_vs_baseline_full"]
+    return (
+        f"{label}: threshold={item['threshold']:.3f}, "
+        f"f1={metrics['f1']:.4f} ({delta['f1']:+.4f}), "
+        f"errors={metrics['errors']} ({delta['errors']:+}), "
+        f"fp/fn={metrics['false_positive']}/{metrics['false_negative']} "
+        f"({delta['false_positive']:+}/{delta['false_negative']:+})"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate a feature mask vs full-feature baseline.")
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -121,6 +202,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--thresholds",
         default="0.45,0.50,0.55,0.60,0.65,0.70",
         help="Comma-separated thresholds to compare.",
+    )
+    parser.add_argument(
+        "--baseline-threshold",
+        type=float,
+        default=0.5,
+        help="Full-feature threshold used as the comparison baseline. Must be included in --thresholds.",
     )
     parser.add_argument("--output-json", type=Path, default=Path("reports/feature_mask_eval.json"))
     return parser
@@ -174,7 +261,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "delta_mask_minus_full": delta_metrics(mask_row, full_row),
         })
 
-    best_mask = max(rows, key=lambda row: (row["mask"]["f1"], -row["mask"]["errors"]))
+    summary = build_summary(rows, args.baseline_threshold)
+    best_mask = summary["best_mask_f1"]
     payload = {
         "checkpoint": str(args.checkpoint),
         "data_dir": args.data_dir,
@@ -188,8 +276,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "samples": int(labels.shape[0]),
         "thresholds": thresholds,
         "rows": rows,
+        "summary": summary,
         "best_mask_threshold": best_mask["threshold"],
-        "best_mask_metrics": best_mask["mask"],
+        "best_mask_metrics": best_mask["metrics"],
     }
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -202,6 +291,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"{row['mask']['false_positive']}/{row['mask']['false_negative']} | "
             f"{row['mask']['errors']}"
         )
+    print("summary vs full baseline")
+    print(
+        f"baseline full: threshold={summary['baseline_full']['threshold']:.3f}, "
+        f"f1={summary['baseline_full']['metrics']['f1']:.4f}, "
+        f"errors={summary['baseline_full']['metrics']['errors']}, "
+        f"fp/fn={summary['baseline_full']['metrics']['false_positive']}/"
+        f"{summary['baseline_full']['metrics']['false_negative']}"
+    )
+    print(format_summary_line("best full f1", summary["best_full_f1"]))
+    print(format_summary_line("best full errors", summary["best_full_errors"]))
+    print(format_summary_line("best mask f1", summary["best_mask_f1"]))
+    print(format_summary_line("best mask errors", summary["best_mask_errors"]))
     print(f"JSON: {args.output_json}")
     return 0
 
