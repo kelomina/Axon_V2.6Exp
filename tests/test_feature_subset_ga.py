@@ -13,6 +13,7 @@ from search_feature_subset_ga import (  # noqa: E402
     parse_thresholds,
     repair_individual,
     run_genetic_search,
+    split_batches_stratified,
 )
 
 
@@ -116,3 +117,27 @@ def test_run_genetic_search_accepts_synthetic_evaluator():
 
     assert result["best"]["metrics"]["f1"] == 1.0
     assert result["evaluated_candidates"] >= 1
+
+
+def test_split_batches_stratified_creates_balanced_holdout():
+    torch = __import__("torch")
+    byte_seq = torch.arange(8 * 4).reshape(8, 4)
+    pe_features = torch.arange(8 * 3, dtype=torch.float32).reshape(8, 3)
+    stat_features = torch.arange(8 * 2, dtype=torch.float32).reshape(8, 2)
+    labels = np.array([0, 0, 0, 0, 1, 1, 1, 1], dtype=np.int64)
+
+    search_batches, search_labels, holdout_batches, holdout_labels = split_batches_stratified(
+        [(byte_seq, pe_features, stat_features)],
+        labels,
+        holdout_ratio=0.25,
+        seed=11,
+    )
+
+    assert len(search_batches) == 1
+    assert len(holdout_batches) == 1
+    assert search_labels.shape[0] == 6
+    assert holdout_labels.shape[0] == 2
+    assert search_labels.tolist().count(0) == 3
+    assert search_labels.tolist().count(1) == 3
+    assert holdout_labels.tolist().count(0) == 1
+    assert holdout_labels.tolist().count(1) == 1

@@ -35,6 +35,9 @@ from model import AxonMalwareModel  # noqa: E402
 from security import load_safe_checkpoint  # noqa: E402
 
 
+Batch = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+
 @dataclass(frozen=True)
 class FeatureMaskSpec:
     """描述 GA 个体如何映射到模型输入 mask。
@@ -477,7 +480,7 @@ def collect_eval_batches(
     loader,
     device: torch.device,
     max_batches: Optional[int],
-) -> tuple[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]], np.ndarray]:
+) -> tuple[list[Batch], np.ndarray]:
     batches = []
     labels_all = []
     for batch_idx, (byte_seq, pe_features, stat_features, labels) in enumerate(loader):
@@ -496,10 +499,69 @@ def collect_eval_batches(
     return batches, np.asarray(labels_all, dtype=np.int64)
 
 
+def split_batches_stratified(
+    batches: Sequence[Batch],
+    labels: np.ndarray,
+    holdout_ratio: float,
+    seed: int,
+) -> tuple[list[Batch], np.ndarray, list[Batch], np.ndarray]:
+    """按标签均衡切出 search/holdout，避免 GA 在同一批样本上自证成功。
+
+    DataLoader 已经把样本分成 batch 了。为了保持实现简单可靠，这里先把这些
+    batch 拼起来，再按标签打散切分，最后重新组成两个“内存 batch”。
+    """
+    if not 0 < holdout_ratio < 1:
+        raise ValueError("holdout_ratio must be in (0, 1)")
+
+    byte_seq = torch.cat([batch[0] for batch in batches], dim=0)
+    pe_features = torch.cat([batch[1] for batch in batches], dim=0)
+    stat_features = torch.cat([batch[2] for batch in batches], dim=0)
+    labels = np.asarray(labels, dtype=np.int64)
+    if labels.shape[0] != byte_seq.shape[0]:
+        raise ValueError("labels and batches have different sample counts")
+
+    rng = random.Random(seed)
+    search_indices: list[int] = []
+    holdout_indices: list[int] = []
+    for label in sorted(set(labels.tolist())):
+        indices = np.flatnonzero(labels == label).astype(int).tolist()
+        rng.shuffle(indices)
+        holdout_count = int(round(len(indices) * holdout_ratio))
+        if len(indices) > 1:
+            holdout_count = min(len(indices) - 1, max(1, holdout_count))
+        holdout_indices.extend(indices[:holdout_count])
+        search_indices.extend(indices[holdout_count:])
+
+    if not search_indices or not holdout_indices:
+        raise ValueError("holdout split produced an empty search or holdout set")
+
+    search_indices.sort()
+    holdout_indices.sort()
+    search_tensor = torch.tensor(search_indices, dtype=torch.long, device=byte_seq.device)
+    holdout_tensor = torch.tensor(holdout_indices, dtype=torch.long, device=byte_seq.device)
+
+    search_batches = [(
+        byte_seq.index_select(0, search_tensor),
+        pe_features.index_select(0, search_tensor),
+        stat_features.index_select(0, search_tensor),
+    )]
+    holdout_batches = [(
+        byte_seq.index_select(0, holdout_tensor),
+        pe_features.index_select(0, holdout_tensor),
+        stat_features.index_select(0, holdout_tensor),
+    )]
+    return (
+        search_batches,
+        labels[np.asarray(search_indices, dtype=np.int64)],
+        holdout_batches,
+        labels[np.asarray(holdout_indices, dtype=np.int64)],
+    )
+
+
 @torch.no_grad()
 def predict_with_masks(
     model: AxonMalwareModel,
-    batches: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    batches: Sequence[Batch],
     spec: FeatureMaskSpec,
     individual: np.ndarray,
     device: torch.device,
@@ -592,6 +654,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-batches", type=int, default=20, help="0 means no limit")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument(
+        "--holdout-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional stratified holdout ratio carved from the loaded evaluation samples. "
+            "GA searches on the remaining samples and reports final confirmation on holdout."
+        ),
+    )
 
     parser.add_argument("--population-size", type=int, default=24)
     parser.add_argument("--generations", type=int, default=12)
@@ -673,6 +744,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     loader = build_eval_loader(args, config, train_config)
     max_batches = None if args.max_batches == 0 else args.max_batches
     batches, labels = collect_eval_batches(loader, device, max_batches)
+    loaded_sample_count = int(labels.shape[0])
+    holdout_batches: list[Batch] = []
+    holdout_labels = np.asarray([], dtype=np.int64)
+    if args.holdout_ratio > 0:
+        batches, labels, holdout_batches, holdout_labels = split_batches_stratified(
+            batches,
+            labels,
+            args.holdout_ratio,
+            args.seed,
+        )
 
     fitness_config = FitnessConfig(
         objective=args.objective,
@@ -698,10 +779,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     full_individual = np.ones(spec.search_dim, dtype=bool)
     full_metrics = evaluate(full_individual)
+    holdout_full_metrics = None
+    if holdout_batches:
+        holdout_full_probs = predict_with_masks(model, holdout_batches, spec, full_individual, device)
+        holdout_full_metrics = choose_best_metrics(holdout_labels, holdout_full_probs, thresholds)
 
     print("Axon feature subset GA")
     print(f"  device: {device}")
-    print(f"  samples: {labels.shape[0]}")
+    print(f"  loaded samples: {loaded_sample_count}")
+    print(f"  search samples: {labels.shape[0]}")
+    if holdout_batches:
+        print(f"  holdout samples: {holdout_labels.shape[0]}")
     print(f"  pe search dim: {spec.pe_search_dim}/{spec.pe_feature_dim}")
     print(f"  ignored PE padding dim: {spec.ignored_pe_dim}")
     print(f"  stat search dim: {spec.stat_feature_dim}")
@@ -722,13 +810,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"unique={row['unique_evaluated']}"
         )
 
+    best_holdout = None
+    if holdout_batches:
+        best_individual = np.asarray(result["best"]["individual"], dtype=bool)
+        holdout_probs = predict_with_masks(model, holdout_batches, spec, best_individual, device)
+        holdout_metrics = choose_best_metrics(holdout_labels, holdout_probs, thresholds)
+        best_holdout = summarize_individual(best_individual, spec, holdout_metrics, fitness_config)
+
     payload = {
         "checkpoint": str(args.checkpoint),
         "data_dir": args.data_dir,
         "split": args.split,
         "split_file": args.split_file,
         "device": str(device),
+        "loaded_samples": loaded_sample_count,
         "samples": int(labels.shape[0]),
+        "search_samples": int(labels.shape[0]),
+        "holdout_samples": int(holdout_labels.shape[0]),
+        "holdout_ratio": float(args.holdout_ratio),
         "thresholds": thresholds,
         "mask_spec": {
             "pe_feature_dim": spec.pe_feature_dim,
@@ -745,7 +844,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "kept_stat": spec.stat_feature_dim,
             "metrics": full_metrics,
         },
+        "holdout_full_features": (
+            {
+                "kept_pe": spec.pe_search_dim,
+                "kept_stat": spec.stat_feature_dim,
+                "metrics": holdout_full_metrics,
+            }
+            if holdout_full_metrics is not None
+            else None
+        ),
         "best": result["best"],
+        "best_holdout": best_holdout,
         "generations": result["generations"],
         "leaderboard": result["leaderboard"][: max(1, args.top_k)],
         "evaluated_candidates": result["evaluated_candidates"],
@@ -761,6 +870,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"auc={best['metrics']['auc']}, kept={best['kept_total']} "
         f"(pe={best['kept_pe']}, stat={best['kept_stat']})"
     )
+    if best_holdout is not None:
+        print(
+            "  holdout "
+            f"f1={best_holdout['metrics']['f1']:.6f}, "
+            f"auc={best_holdout['metrics']['auc']}, "
+            f"fp={best_holdout['metrics']['fp']}, fn={best_holdout['metrics']['fn']}"
+        )
     print(f"  JSON: {args.output_json}")
     print(f"  CSV: {args.output_csv}")
     return 0
